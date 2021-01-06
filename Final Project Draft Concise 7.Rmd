@@ -1,0 +1,539 @@
+---
+title: "STA 9750 Final Project"
+author: "Kimberly Yee Tan, Juan Rodriguez, Eric Sedaghat, Kimberly Choi"
+date: "12/18/2020"
+output: pdf_document
+urlcolor: blue
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(modelr)
+library(ISLR)
+library(rpart)
+library(randomForest)
+knitr::opts_chunk$set(echo = FALSE, dev = "png", dpi=300) ## PNG makes things faster/easier in PDF
+comma <- function(x) format(round(x,1), digits = 1, big.mark = ",")
+options(scipen = 9999)
+```
+
+```{r read raw_data, include= FALSE}
+olympics_rawdata <- as_tibble(readr::read_csv("athlete_events.csv"))
+noc_region <- as_tibble(readr::read_csv("noc_regions1.csv"))
+host_cities <- as_tibble(readr::read_csv("host-cities-olympic.csv"))
+GDP_country <- as_tibble(readr::read_csv("API_GDP1.csv"))
+```
+
+```{r clean and create final data set, include= FALSE} 
+
+# remove NAs in variables of interest: age, height, weight, sex
+olympics_data <- olympics_rawdata %>%
+  filter(Year >= 1966) %>%
+  filter(!is.na(Age), !is.na(Height), !is.na(Weight), !is.na(Sex))
+
+# Removing unnecessary variables in noc_region
+noc_region <- noc_region %>% select (-notes)
+
+# Get country name and GDP per capita per country from API_GDP1
+GDP_country <- GDP_country %>% select(c(`Country Name`, `2018`)) #Using GDP from 2018 as it has lesser NAs and is more recent
+
+#cleaning "d" cities data set to remove columns and filter for year to prevent usage for old names of countries
+host_cities <- host_cities %>% 
+  filter (Year >= 1966) %>% 
+  select(-c(Continent:`Closing Ceremony`))
+
+# Add column for host countries by joining olympics_data with host_cities via "City" column in both tibbles
+olympics_data <- olympics_data %>% 
+  left_join(host_cities, by= c('City' = 'City'))  
+
+#Add a "region" column in olympics_data (region where teams are from) from "noc_region" to be a key later for getting GDP column 
+olympics_data <- olympics_data %>% 
+  left_join(noc_region, by = c('NOC' = 'NOC')) # should 100% match since noc_region was a complimentary dataset
+
+#Add in GDP Column 
+olympics_data <- olympics_data %>% 
+  left_join(GDP_country, by = c('region' = "Country Name")) 
+#25,052 missing when you try to use NOC as left join key instead of region
+# only remove columns with NAs that may result from left join if needed so that no information from olympics_data will be accidentally lost.
+
+#Final removal of ~4K NA's for unmatched regions and GDPs
+olympics_data <- olympics_data %>% 
+  filter(!is.na(`2018`)) # Eliminate NAs that came with the GDP data
+
+#Check summary of main data set a
+colSums(is.na(olympics_data)) #There should only be NA in the Medal column
+
+#Rearrange and rename data columns to reduce confusion
+olympics_data <- olympics_data %>%
+  select(ID:NOC, region, `2018`, Games, Year, Season, City, Country, Sport:Medal) 
+
+check <- olympics_data %>%   
+  filter(Team != region) #Teams may be from different parts of a country. Using "Team Country" is more accurate.
+
+olympics_data <- olympics_data %>% rename("GDP" = `2018`) %>%
+  rename("Team_Country" = "region") %>%
+  rename("Host_City" = "City") %>%
+  rename("Host_Country" = "Country")
+view(olympics_data)
+```
+
+## Olympics: Event Winning Predictors and Performance by Gender over time
+## Introduction
+
+It has been 124 years since the first modern Olympics took place in 1896. For our project, our group will be analyzing 50 years of Olympic history to:  
+
+* Determine if there are certain factors that can predict the chances of an athlete winning an event
+* Compare male versus female performance by countries over the years
+
+The main data set we will be using for our analyses will be "120 years of Olympic history: athletes and results" from [Kaggle.com (dataset)](https://www.kaggle.com/heesoo37/120-years-of-olympic-history-athletes-and-results). This data set contains the biographical data of athletes and the medal results from the 1896 to 2016 Olympics games.
+
+We have obtained other data sets to add a "GDP" column to our main data set to aid further analysis later. As there are many countries participating in the Olympics, we have decided to group countries into developed and developing countries based on the countries' GDP for our analyses. We have obtained another data set, "API-GDP1", under the subheading "Per Capita GDP in US Dollars" from the [United Nations Statistics Division](https://unstats.un.org/unsd/snaama/downloads). "noc_regions" was a data set provided with our main data set and "host_cities" was obtained from [The World Bank](https://data.worldbank.org/indicator/NY.GDP.PCAP.CD).
+
+### Summary of Data Set
+
+Our main data set, "athlete_events", originally had `r comma(nrow(olympics_rawdata))` rows of data. However, perhaps the data dates too far back in time and there wasn't as much of an importance in recording the biographical information of athletes in the old days, there are a lot of NAs in certain variables of interest for our analyses (Age, Weight, and Height).  
+
+To obtain meaningful data by reducing the number of NAs in the columns with data of said variables of interest, we have filtered the data to observations from the past 50 years (1966-2016). We have also filtered out remaining observations with NAs in the Age, Weight, Height, and Sex columns.  
+
+We are now left with `r comma(nrow(olympics_data))` rows for our analyses. The current data set has 18 variables: `r colnames(olympics_data)`. Main subgroups of potential relevance present in the data are: Sex (Male and Female), Team Countries, Year, Winter and Summer season, Sport, Host Countries, Medal, and development state of countries by GDP.
+
+
+## Hypothesis
+
+We are looking to explore two questions with our data set:
+
+* What is the importance of an athletes' age, height, weight, BMI, and home country's GDP in their Olympic performance?
+* How does the gender affect the athlete's performance over time with regards to their country's GDP and stage of development?
+
+Our hypothesis is as follows: 
+
+Athletes of age 18 to 25 are more likely to win. Athletes from developed countries will also perform better than those from developing countries due to having more training equipment, space, and overall resources available for them to prepare for the Olympics. Females overall will have a higher rate of performance improvement over time due to improved gender equality in recent years.
+
+Before we start analyzing, below are some limitations we have identified about our data:  
+
+* Limited amount of variables we can use for data analysis (many more factors go into determining performance of athletes)
+* Loss of data due to missing data in one or more variables of interest (have to be filtered out) 
+
+## Exploratory Analysis
+
+```{r Add classification column for country development stage}
+# Too many countries, classification into "" and "Developing" easier
+
+olympics_data <- olympics_data %>%
+  mutate(Developed = ifelse(GDP > 12000, TRUE, FALSE))
+```
+
+###  Potential Differentiating Factors for Performance
+
+```{r medalist and non-medalist}
+olympics_data_winner <- olympics_data %>%
+  filter(!is.na(Medal))
+olympics_data_nonwinner <- olympics_data %>%
+  filter(is.na(Medal))
+olympics_data_medal <- olympics_data %>% 
+  mutate(medal_yn = ifelse(is.na(Medal), "Non-medalists", "Medalists"))
+```
+
+```{r age vs medal histogram, figures-side, fig.show="hold", out.width="60%"}
+olympics_data_medal %>% ggplot(aes(Age)) +
+  geom_histogram(binwidth=5, fill="white", color = "darkgray") +
+  facet_wrap(~medal_yn) +
+  ggtitle("Non-medalist and Medalist Age Distribution") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  geom_vline(data = olympics_data_winner, aes(xintercept = mean(Age), color = 'medalists mean'), show.legend = TRUE, size = 0.6) +
+  geom_vline(data = olympics_data_nonwinner, aes(xintercept = mean(Age), color = 'non-medalists mean'), show.legend = TRUE, size = 0.6)
+```
+
+To see whether age, height, and weight affects performance, the distribution of age, height, and weight of non-medalists and medalists are compared side-by-side to see if there are any striking differences. As we can see from the figure above, the age distribution between non-medalists and medalists are similar. When we compare the mean age of both, it is noticed that the average age of medal winners are slightly higher than non-medalists. However, with such small differences, there is little to suggest age plays a significant role in predicting the performance of athletes and whether they will win.
+
+```{r height, weight vs medal histogram, figures-side, fig.show="hold", out.width="50%"}
+olympics_data_medal %>% ggplot(aes(Height)) +
+  geom_histogram(binwidth=5, fill="white", color = "darkgray") + 
+  facet_wrap(~medal_yn) +
+  ggtitle("Non-medalist and Medalist Height Distribution") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  geom_vline(data = olympics_data_winner, aes(xintercept = mean(Height), color = 'medalists mean'), show.legend = TRUE, size = .5) +
+  geom_vline(data = olympics_data_nonwinner, aes(xintercept = mean(Height), color = 'non-medalists mean'), show.legend = TRUE, size = .5) 
+
+olympics_data_medal %>% ggplot(aes(Weight)) +
+  geom_histogram(binwidth=5, fill="white", color = "darkgray") + 
+  facet_wrap(~medal_yn) +
+  ggtitle("Non-medalist and Medalist Weight Distribution") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  geom_vline(data = olympics_data_winner, aes(xintercept = mean(Weight), color = 'medalists mean'), show.legend = TRUE, size = .5) +
+  geom_vline(data = olympics_data_nonwinner, aes(xintercept = mean(Weight), color = 'non-medalists mean'), show.legend = TRUE, size = .5) 
+```
+
+Similar to age, the height and weight distribution between non-medalists and medalists are similar too. However, a few things are observed. The height distribution of medalists is a smooth bell-shaped curve with the majority of medalists having a height of 180cm. However, the height distribution of non-medalist shows that heights slightly lower or higher than 180cm are more common among non-medalists. This could suggest that there is an optimal height that could predict performance. 
+
+We also observe from the figure on weight distribution that the weight range for medalists is slightly smaller than non-medalists, with the left tail of the medalists weight distribution shorter than that of non-medalists. It is also noted that the mean height and weight of medalists are also higher than non-medalists. This could indicate that there is a certain range of weight and height that medalists tend to have, predicting performance. 
+
+```{r age group with most medals, figures-side, fig.show="hold", out.width="50%", message = FALSE}
+
+olympics_data_medal <- olympics_data_medal %>%
+  mutate(win = ifelse(!is.na(Medal), 1,0)) 
+olympics_data_medal_age <- olympics_data_medal %>%
+  mutate(medals_total = sum(win)) %>%
+  group_by(Age) %>%
+  mutate(age_medal_count = sum(win)) %>%
+  mutate(average_medals = sum(win)/medals_total) %>%
+  ungroup()
+
+olympics_data_medal_age %>% ggplot(aes(Age)) +
+  geom_histogram(binwidth=2, fill="white", color = "darkgray") + 
+  ggtitle("Age with Most Medals Out of Total") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+The above figure shows the amount of medals won out of the total number of medals awarded in the past 50 years by age. We aim to see if there is a certain age range that wins more medals than others. From the figure above, we can see that indeed there is a difference. Those who are 22 to 24 years old earns the most medals compared to other ages. This is perhaps because athletes at these ages tend to have more experience and their bodies are in prime condition (not too young, not too old). This implies that age does have a certain effect on performance and that it is an important variable in a model predicting winning an Olympic event.
+
+Having identified the most common age among medalists in general, we use histograms next, to see if there are differences in the age distributions among male and female medalists to gain insight on what ages perform the best for each.
+
+```{r male and female medalist age distribution, figures-side, fig.show="hold", out.width="60%"}
+olympics_data_female_medal <- olympics_data_medal %>% filter(Sex == 'F') %>% filter(!is.na(Medal))
+olympics_data_male_medal <- olympics_data_medal %>% filter(Sex == 'M')  %>% filter(!is.na(Medal))
+
+ggplot(olympics_data_winner, aes(Age)) + geom_histogram(binwidth = 1, fill = 'white', color = 'darkgray') +
+  facet_wrap(~ Sex) +
+  geom_vline(data = olympics_data_female_medal, aes(xintercept = mean(Age, na.rm = TRUE), color = 'female mean'), show.legend = TRUE, size = .5) +
+  geom_vline(data = olympics_data_female_medal, aes(xintercept = median(Age, na.rm = TRUE), color = 'female median'), show.legend = TRUE, size = .5) +
+  geom_vline(data = olympics_data_male_medal, aes(xintercept = mean(Age, na.rm = TRUE), color = 'male mean'), show.legend = TRUE, size = .5) +
+  geom_vline(data = olympics_data_male_medal, aes(xintercept = median(Age, na.rm = TRUE), color = 'male median'), show.legend = TRUE, size = .5) +
+  ggtitle("Age Distribution of Male and Female Medal Medalists") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+From the age distributions of medalists we can see that the male distribution is more left skewed with a higher mean and median than the female age distribution of medalists. The peak of the female age distribution is at age 24 and 25 while the peak for the male age distribution is 23 and 24, slightly younger. The male distribution had a mean age of `r mean(olympics_data_male_medal$Age)` while the female distribution had a mean age of `r mean(olympics_data_female_medal$Age)`.
+
+```{r age, weight vs year line graph, figures-side, fig.show="hold", out.width="50%", message = FALSE}
+olympics_data_age <- olympics_data %>% select(Age, Year) %>% group_by(Year) %>% summarize(average_age = mean(Age)) %>%
+  ungroup()
+ggplot(olympics_data_age, aes(Year, average_age)) +
+  ggtitle("Olympics Average Age Trend from 1966-2016") +
+  geom_line()
+
+olympics_data_weight <- olympics_data %>% select(Weight, Year) %>% group_by(Year) %>% summarize(average_weight = mean(Weight)) %>%
+  ungroup()
+ggplot(olympics_data_weight, aes(Year, average_weight)) +
+  ggtitle("Olympics Average Weight Trend from 1966-2016") +
+  geom_line()
+```
+
+As the Olympics gets increasingly more competitive over the years, instead of only comparing the difference in age, height, and weight between medalists and non-medalists, we decided to see if there are any trends in age, height, and weight over the years that could indicate its importance for Olympics-eligible performance. From the above line graph, we can see that the age for Olympians has been increasing since 1980. This could indicate that experience and a grown body is related to better performance. It also may be due to advancements in certain fields and technologies, life better rehabilitation for atheletes, that have allowed for athletes to continue performing for longer moving up the average age of competitors.
+
+We also observe that the average weight for Olympians has also been increasing over the years. This is in alignment with our previous findings where medalists have a heavier weight on average than non-medalists. This indicates a potential relationship between weight and performance.
+
+```{r height vs year line graph, figures-side, fig.show="hold", out.width="50%", message = FALSE}
+olympics_data_height <- olympics_data %>% select(Height, Year) %>% group_by(Year) %>% summarize(average_height = mean(Height)) %>%
+  ungroup()
+ggplot(olympics_data_height, aes(Year, average_height)) +
+  ggtitle("Olympics Average Height Trend from 1966-2016") + 
+  geom_line()
+```
+
+We also observe that there have been an increase in average height over the years for Olympians. However, it seems to be showing signs of slowing down (fluctuations of similar scale since 1994). This could be because there is a limit as to how tall a person can grow. The overall trend observed in the line graph shows that height could be a factor for great performance (qualify to participate in the Olympics), but its impact could be limited/ smaller than other factors for winning considered. We should also take into account that the increase in the average height of athletes could also be attributed to how the average height of humans is increasing with each generation.
+
+
+```{r Calculate BMI and graph total medals, figures-side, fig.show="hold", out.width="50%", message = FALSE}
+##Exploratory figures two histograms of the entire data set mapping age and bmi with a mean and median line
+olympics_data_medal <- olympics_data_medal %>%
+  mutate(BMI = Weight/(Height*.01)**2)
+
+ggplot(olympics_data_medal, aes(x = BMI)) + geom_histogram(binwidth = 2, fill = 'white', color = 'darkgray') + 
+  geom_vline(aes(xintercept = mean(BMI, na.rm = TRUE), color = 'mean'), show.legend = TRUE, size = .5) +
+  geom_vline(aes(xintercept = median(BMI, na.rm = TRUE), color = 'median'), show.legend = TRUE, size = .5) +
+  ggtitle("BMI distribution Among Olympic Athletes") +
+  theme(plot.title = element_text(hjust = 0.5))
+  
+```   
+
+Above is a histogram showing the BMI distributions of all athletes. Our mean BMI is `r mean(olympics_data_medal$BMI)` with a standard deviation of `r sqrt(var(olympics_data_medal$BMI))`. The BMI follows a relatively normal distribution with mean and median values found grouped together near the peak. The most common BMI among athletes is 22. 
+
+### Male Versus Female Performance Over the Years
+
+```{r male vs female Medalist over the Years line graph}
+
+olympics_data_sex <- olympics_data %>%
+  mutate(Development = ifelse( Developed == TRUE, "Developed", "Developing")) %>%
+  mutate(medalist = ifelse(!is.na(Medal), "Medalist", "Non-medalist")) %>%
+  group_by(Year, Development, medalist, Sex, Season) %>%
+  mutate(Total_medal = n()) %>%
+  ungroup()
+
+olympics_data_sex %>% filter(medalist == "Medalist") %>%
+  ggplot(aes(Year, Total_medal)) +
+  geom_line() + 
+  geom_point() +
+  facet_grid(Sex~Development + Season)
+
+```
+
+To compare the performance of male and female athletes from and developing countries, the total number of gold medals won per year among the sub groups of male from developing country, female from developing country, male from countries, and male from developing countries was used to measure performance. We further split it by season to account for any potential season-related differences such as sports and countries participating in each season.
+
+From the line graphs above, a few interesting observations are derived. Over the years, the performance of female athletes from countries in the Summer season have been improving exponentially. On the other hand, the performance of male athletes in the Summer season seems to be stagnating and hasn't shown much improvement over the years, especially when compared to the performance of females.
+
+For the Winter season, however, we see that the performance of both male and female athletes from countries have been improving at a similar rate over the years. The same can be said for performance of both male and female athletes from developing countries during the Winter season. During the Summer season however, the rate of improvement for female athletes from developing countries (by seeing the steepness of the slope) seems to be higher than that of male athletes from developing countries.
+
+
+```{r Calculate and prepare data for total medals graph}
+
+#Calculate number of male athletes from developing countries
+male_athletes_developing <- olympics_data_medal %>%
+filter(Sex == "M" & Developed == FALSE)
+n_male_developing = count(male_athletes_developing)
+
+#Calculate number of female athletes from developing countries
+female_athletes_developing  <- olympics_data_medal %>%
+filter(Sex == "F" & Developed == FALSE)
+n_female_developing = count(female_athletes_developing)
+
+#Calculate number of male athletes from developed countries
+male_athletes_developed <- olympics_data_medal %>%
+filter(Sex == "M" & Developed == TRUE)
+n_male_developed = count(male_athletes_developed)
+
+#Calculate number of female athletes from developed countries
+female_athletes_developed  <- olympics_data_medal %>%
+filter(Sex == "F" & Developed == TRUE)
+n_female_developed = count(female_athletes_developed)
+
+#Select all medal winners from developing countries
+developing <- olympics_data_winner %>%
+  filter(Developed == FALSE)
+
+#Count medal winners from developing countries by sex
+developing_medals_by_sex <- developing %>% 
+  select(Sex,Developed) %>%
+  group_by(Sex, Developed)%>%
+  count(Sex)%>%
+  ungroup()
+
+#Set logical field developed to FALSE
+developing_medals_by_sex <-developing_medals_by_sex %>% 
+  rename("Medals" = "n") 
+
+#Add total of male participants from developing countries to data
+developing_medals_by_sex <- mutate(developing_medals_by_sex, Total_athletes = ifelse(Sex == "M" ,as.integer(n_male_developing) ,as.integer(n_female_developing)))
+
+#Select all medal winners from developed countries
+developed <- olympics_data_winner %>%
+   filter(Developed == TRUE)
+
+#Count medal winners from developed countries by sex
+developed_medals_by_sex <- developed %>% 
+  select(Sex, Developed) %>%
+  group_by(Sex, Developed)%>%
+  count(Sex)
+
+#Set logical field developed to TRUE
+developed_medals_by_sex <- developed_medals_by_sex %>% 
+  rename("Medals" = "n") 
+
+#Add total of male participants from developed countries to data
+developed_medals_by_sex <- mutate(developed_medals_by_sex, Total_athletes = ifelse(Sex == "M" ,as.integer(n_male_developed) ,as.integer(n_female_developed)))
+
+#Merge results of developed and developing countries for ggplot
+medal_results <- rbind(developed_medals_by_sex, developing_medals_by_sex)
+
+#Calculate and add the % of medal winners
+medal_results <- medal_results %>% mutate(Percent_winners =(Medals/Total_athletes)*100)
+
+```
+
+```{r display bar graphs for developed and developing, figures-side, fig.show="hold", out.width="50%", message = FALSE}
+ggplot(data=medal_results, aes(x=Sex, y=Total_athletes, fill=Developed)) +
+  ggtitle("Total Male and Female Participants \n in Developed and Developing Countries")+
+  theme(plot.title = element_text(size = 5, face = "bold", hjust = 0.5 )) +
+  geom_bar(stat="identity",position=position_dodge())  +
+  labs(x="Sex", y = "Number of Participating Athletes")+
+  geom_text(aes(label=Total_athletes),vjust=1.6, color="white",
+              position = position_dodge(0.9), size=3.5) +
+  theme_minimal()
+
+ggplot(data=medal_results, aes(x=Sex, y= Medals, fill=Developed)) +
+  ggtitle("Medals Won by Males and Females \n in Developed and Developing Countries") +
+  theme(plot.title = element_text(size = 5, face = "bold", hjust = 0.5 )) +
+  geom_bar(stat="identity",position=position_dodge()) +
+  labs(x="Sex", y = "Number of Medals")+
+  geom_text(aes(label=Medals), vjust=1.6, color="white",
+              position = position_dodge(0.9), size=3.5) +
+  theme_minimal()
+
+ggplot(data=medal_results, aes(x=Sex, y=Percent_winners, fill=Developed)) +
+  ggtitle("% of Male and Female Medal Winners \n in Developed and Developing Countries") +
+  theme(plot.title = element_text(size = 5, face = "bold", hjust = 0.5 )) +
+  geom_bar(stat="identity",position=position_dodge())  +
+  labs(x="Sex", y = "Percentage of Medal Winners")+
+  geom_text(aes(label= round(Percent_winners, digits=2)),vjust=1.6, color="white", position = position_dodge(0.9), size=3.5) +
+  theme_minimal()
+```  
+Countries were sorted into two categories, developing and developed using the 2018 GDP of 12,000 or less for developing and greater than 12,000 for developed. We next calculated the total number of athletes who participated in Olympic games, the number of medal winners and the percentage of medal winners for males and females. 
+Our first bar graph shows that there are approximate half the number of participants from developing countries than developed countries for both males and females. 
+Our next bar graph shows that both the male and female athletes from developing countries won less medals than those of developed countries. The number of medals won by athletes from developing countries is about 41% of those from developed countries for both males and females. The percentage of women vs men winning medals in developing and developed countries both average at about 61%. Therefore, although the total number of medals for developing countries is lower, the ratio of female to male medals is comparable for developing and developed countries. 
+The last bar graph shows the percentage of medal winners by comparing them to the total number of participants in the same group. This graph depicts that there is little statistical difference in the probability of winning a medal based on whether an athlete is from a developing or developed country.
+
+## Advanced Models and Analysis
+
+### Model: How Well Does Age, Height, Weight, BMI, and GDP Predict Olympic Winnings
+
+```{r Model Anaylysis Prep}
+# win replace medal_numeric
+
+olympics_data_medal <- olympics_data_medal %>%
+  group_by(Year, Team_Country) %>%
+  mutate(Medal_countryavg = mean(win))
+
+olympics_data_medal <- olympics_data_medal %>%
+  group_by(Team_Country) %>%
+  mutate(team_country_wins = sum(win))
+
+set.seed(9750)
+olympics_train_indices <- sample(1:nrow(olympics_data_medal), 0.8*nrow(olympics_data_medal))
+olympics_train <- olympics_data_medal %>% slice(olympics_train_indices)
+olympics_test <- olympics_data_medal %>% slice(-olympics_train_indices)
+```
+
+
+#### Linear Model
+
+We will be using all of the following variables: Age, Weight, Height, BMI, Developmental status of home country, and Sex in a linear model to see how well it can predict the average medals won per country. 
+
+```{r linear model new, comment = ""}
+
+mod_olympics_model_new <- lm(Medal_countryavg ~ Age + Weight + Height + BMI + Developed + Sex, data= olympics_train)
+summary(mod_olympics_model_new)
+
+mod_olympics_test <- olympics_test %>% 
+  add_predictions(mod_olympics_model_new, var = "pred4") %>%
+  add_residuals(mod_olympics_model_new, var="olympics_resid")
+
+sqrt(mean((mod_olympics_test$Medal_countryavg - mod_olympics_test$pred4)^2))
+
+# r2 value: 0.02023 
+
+# rmse = 0.1133922
+
+```
+
+```{r residual plot 1}
+mod_olympics_test %>% ggplot(aes(x=olympics_resid)) + 
+  geom_density(alpha=0.6) + xlim(-2.5, 2.5) +
+  xlab("Predicted Medal Residuals")
+```
+
+With this linear model, we obtained a r^2 value of 0.02023 and rmse value of 0.1133922. Although these values are not ideal (do not indicate high predictive power), this is the best fit we could obtain using the variables from the data we are currently using.
+
+According to the summary results we obtained from this model, all variables included have a low p-value (below the 5% threshold for significance). Looking at these p-values, there is no one variable that stands out in showing high predictive ability.
+
+Above is a plot of the residuals from our model. The majority of the values are around 0 which shows that our regression model is pretty accurate at predicting the data. There seems to be a higher density of residuals that are negative (below the regression line on the left side) than positive ones. This means that the majority of this time, our model will over predict the average medals won per country. 
+
+We have run other linear models with different combinations of predictor variables. However, the r^2 and rmse values for those models suggest poorer predictive ability (r^2 value was lower and rmse value was higher) than the model we currently have.
+
+### Model: Does Sex and Year Predict Number of Wins Per Team?
+### Linear Model 2
+
+
+```{r Linear Model for Wins Per Team, comment = ""}
+
+mod_olympics_sex2 <- lm(win ~ Sex*Year + Season, data= olympics_train)
+summary(mod_olympics_sex2)
+# r2 = 0.00188
+mod_olympics_test <- olympics_test %>% 
+  add_predictions(mod_olympics_sex2, var = "predwin2")
+  
+sqrt(mean((mod_olympics_test$win - mod_olympics_test$predwin2)^2))
+#rmse = 0.3536402
+```
+
+
+```{r sex and year interaction linear model, comment = ""}
+
+mod_olympics_fandm <- lm(win ~ Sex*Year + Developed, data = olympics_train)
+mod_olympics_test <- olympics_test %>% 
+  add_predictions(mod_olympics_fandm, var = "predfm") %>%
+  add_residuals(mod_olympics_fandm, var="olympics_fmresid")
+
+summary(mod_olympics_fandm)
+
+sqrt(mean((mod_olympics_test$win - mod_olympics_test$predfm)^2))
+
+# r2 value: 0.0009236  
+#rmse: 0.3539753
+```
+
+By comparing the r^2 and rmse value of the two linear models, mod_olympics_sex2 and mod_olympics_fandm, we see that the first model performs better in predicting whether an athlete wins or not. mod_olympics_sex2 has an r^2 value of 0.00188 and rmse value of 0.3536402 while mod_olympics_fandm has a r^2 and rmse value of 0.0009236 and 0.3539753 respectively. The higher the r^2 value and lower the rmse, the better the fit of the model. From this, we see that season a slightly better predictor variable than the development of a country. The poor predictive ability of the model shows that gender and year does not play a big role in determining whether an ahtlete wins.
+
+```{r residual plot 2}
+mod_olympics_test %>% ggplot(aes(x=olympics_fmresid)) + 
+  geom_density(alpha=0.6) + xlim(-2.5, 2.5) +
+  xlab("Predicted Medal Residuals")
+```
+
+From this residual plot of our linear model for predicting whether an athlete will win based on the interaction variable of Sex and Competing year, and developmental status of their home country, we can see that the majority of the residuals are close to 0, on the negative side. This means that our model will over predict if someone is a medalist. Because our dependent variable, win, is binary, we see two peaks in the residual plot.
+
+
+#### Random Forest
+
+We then ran a random forest model to see how well the same variables would be at predicting whether an athlete would win at the Olympics. 
+
+```{r random forest, include = FALSE}
+
+forest_olympic_data_medal <- randomForest(as.factor(win) ~ Age + Weight + Height + BMI + Developed + Sex, data = olympics_train, ntree = 200, importance = TRUE, do.trace = 10)
+
+```
+
+```{r forest_olympic_data_medal, comment=""}
+forest_olympic_data_medal
+
+importance(forest_olympic_data_medal, type = 1) 
+
+rmse(forest_olympic_data_medal, olympics_test)
+```
+
+The most important variables to predict whether someone will be a medalist are in the following order: Sex, Age, Developmental Status of home country, Height, BMI, and Weight. The OOB error is really high and stays around 14%-15% regardless of how many trees we have on the model. We would need additional variables to better predict whether an individual would be a medalist. 
+There is a much higher error rate on class 2 than class 1. 
+From this information, we have concluded that we cannot accurately predict a medalist from a non-medalist with our current data and variables.
+
+When calculating the rmse for forest_olympic_data_medal, we were met with the message "not meaningful for factors". This further supports our results from our linear model analysis, showing that the current variables investigated are insufficient for predicting whether an athlete wins at the Olympics.
+
+Next we will create another random forest model to see the predictive ability of the variables and how they predict the average medal count per country per year.
+
+```{r randomforest new, include = FALSE}
+forest_olympic_medal <- randomForest(Medal_countryavg ~ Age + Weight + Height + BMI + Developed + Sex, data = olympics_train, ntree = 200, importance = TRUE, do.trace = 10)
+
+```
+
+```{r forest_olympic_medal, comment = ""}
+
+forest_olympic_medal
+importance(forest_olympic_medal, type = 1)  
+rmse(forest_olympic_medal, olympics_test)
+```
+
+We can see that the most predictive variable is still Sex, followed by the developmental status of a country, Age, BMI, Height and Weight. The % Var explained for this randomForest model is around 12%, which shows that this is a poorly predicative model. The variables chosen do not predict either dependent variables well. 
+
+However, by calculating the rmse value for forest_olympic_medal, we see that our current variables are better at predicting the average number of medals won per team per year.
+
+## Conclusion: 
+
+Predicting whether an athlete will win the Olympics is a very intricate task. After all, there are many factors that can contribute to this, from an individual’s preparation time to their genetics, and much more. Our data set had limited variables for us to consider and thus even after running multiple models, we still feel like more variables would have to be considered for one to better predict winning attributes of an athlete.  
+
+With the linear models we ran, based on the r-square values of each variable, we saw that the top two most important variables were Weight and Height. But when we ran the ran the Random Forest model, we saw that Age and Sex were the most important. While these results are not mutually exclusive, we thought it was interesting that they did not match up. We also did not have a high RMSE value when we ran different versions of the random forest models. The only time we did see above 50% for the RMSE was when we included the variable of NOC or Home Team’s Country which we later decided to take out since it would create some bias in the model. For example, if certain countries were more susceptible to winning within the 50-year period we looked at, then the athlete representatives from those countries would have a “boost” simply from being from their home country and not the individual's statistics. Additionally, Team Country were included in the calculation of the dependent variable, which could be the main reason why there was such a high boost in the predictive power of the model.  
+
+
+## Other factors and further comments: 
+
+## Limitation to our data/bias:  
+
+We should note that a country’s GDP changes year over year, but we are only using their 2018 GDP throughout our analysis. Countries could have changed from a “developing” to a “developed” country within the 50 years we analyzed and this categorization could have caused a bias in our models.  
+
+We also based performance on whether an athlete would win any medal. Therefore, our two performance buckets were winners and participants. A bronze, silver or gold medal all counted the same in our analysis. We did this because picking values for each medal would be strictly arbitrary. For example, if we assigned values: 1,2,3, respectively, we would be assuming (with no proven data) that a gold medal is 3 times harder to win than a bronze one.  
+
+Additionally, we looked at winners at the Olympics as a whole. There are many sports and events in the Olympics that require different weights, heights, ages for optimal performance. We tried to do exploratory analysis but realized the data varied too much.
+
+
+## Overall Analysis 
+
+We believe that the predictive ability of our models needs to be improved upon before predicting the next Olympic winners. We believe that more information about a myriad of other factors may help us to improve our predictive abilities in Olympic Medal winners. To conclude, we have found that the variables we used do not provide enough predictive ability to accurately and consistently predict a a medal winner and more data would be needed to improve upon that.  
